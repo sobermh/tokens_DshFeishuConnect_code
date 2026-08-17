@@ -6,8 +6,10 @@
  * scope grant pre-filled), then the plugin provisions the official Larksuite
  * CLI (pinned, SHA-256-verified) and drives its built-in device-code login —
  * the user opens a SECOND link, authorizes, and lark-cli stores the personal
- * user token in the OS keychain. No redirect URL, no whitelist, no admin
- * approval. Domain tools (`feishu_create_doc`, `feishu_send_message`,
+ * user token in the OS keychain. The flow is idempotent — an existing session
+ * is reused with no link, and a returning user who only needs to re-authorize
+ * opens just that one link. No redirect URL, no whitelist, no admin approval.
+ * Domain tools (`feishu_create_doc`, `feishu_send_message`,
  * `feishu_create_bitable`) then act as that personal identity through the
  * generic `lark-cli api` passthrough. `/feishu-connect` and `/feishu-status`
  * expose the same flow to humans.
@@ -21,7 +23,8 @@ import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { beginRegistration, pollRegistration } from './register.ts'
 import { TENANT_SCOPES, USER_SCOPES } from './scopes.ts'
-import { createLarkcli } from './larkcli.ts'
+import { createLarkcli, type AuthStatus } from './larkcli.ts'
+import { readIdentity, writeIdentity, type IdentityRecord } from './identity.ts'
 
 export const name = 'feishu'
 export const inject = ['tools', 'credentials']
@@ -100,7 +103,55 @@ export function apply(ctx: Context, config: Config) {
     })
   }
 
-  async function runConnectFlow(domain: 'feishu' | 'lark', signal: AbortSignal): Promise<void> {
+  /** Connected-state message, naming the user (falling back to cached identity). */
+  async function connectedMessage(status: AuthStatus): Promise<string> {
+    let name = status.userName
+    if (name === undefined) name = (await readIdentity(config.profile))?.userName
+    return name === undefined
+      ? 'Feishu is connected with your personal identity.'
+      : `Feishu is connected as ${name}.`
+  }
+
+  /**
+   * Persist a non-secret record of who is connected. The user token is never
+   * written here — lark-cli keeps that in the OS keychain and stays the source
+   * of truth. Best-effort: a failed write must not fail the connection.
+   */
+  async function recordIdentity(status: AuthStatus): Promise<void> {
+    const record: IdentityRecord = { profile: config.profile, connectedAt: new Date().toISOString() }
+    if (status.userName !== undefined) record.userName = status.userName
+    if (status.openId !== undefined) record.openId = status.openId
+    await writeIdentity(record).catch(() => { /* metadata cache is best-effort */ })
+  }
+
+  /**
+   * Authorize against an app whose lark-cli profile config already persists
+   * (created in an earlier run), so the user only opens the single device-code
+   * link. Returns `false` — without surfacing an error — when the profile is not
+   * bound yet (e.g. `~/.lark-cli` was wiped), so the caller falls back to a full
+   * registration. A genuine authorization failure still throws.
+   */
+  async function authorizeReusingApp(signal: AbortSignal): Promise<boolean> {
+    await lark.provision()
+    let begin
+    try {
+      begin = await lark.loginBegin(signal)
+    } catch {
+      return false // profile not configured → re-register the app
+    }
+    setState({
+      phase: 'authorizing',
+      authorizeUrl: begin.verificationUrl,
+      message: 'Open this link and confirm to grant your personal Feishu identity.',
+    })
+    const status = await lark.loginComplete(begin.deviceCode, signal)
+    await recordIdentity(status)
+    setState({ phase: 'connected', message: await connectedMessage(status) })
+    return true
+  }
+
+  /** Full one-click flow: register a brand-new app, bind it, then authorize. */
+  async function registerAndAuthorize(domain: 'feishu' | 'lark', signal: AbortSignal): Promise<void> {
     const session = await beginRegistration({
       domain,
       appName: config.appName,
@@ -153,20 +204,41 @@ export function apply(ctx: Context, config: Config) {
       message: 'App created. Open this link and confirm to grant your personal Feishu identity.',
     })
     const status = await lark.loginComplete(begin.deviceCode, signal)
-    setState({
-      phase: 'connected',
-      message: status.userName === undefined
-        ? 'Feishu is connected with your personal identity.'
-        : `Feishu is connected as ${status.userName}.`,
-    })
+    await recordIdentity(status)
+    setState({ phase: 'connected', message: await connectedMessage(status) })
   }
 
-  function startConnect(domain: 'feishu' | 'lark'): void {
+  /**
+   * Drive the connection idempotently. Without `force`: an existing valid
+   * connection is reused as-is (no link), an already-created app skips straight
+   * to the single authorization link, and only a first-time connection shows
+   * both links. With `force`: the current user session is dropped and personal
+   * authorization is re-run (reusing the app) so a different identity can sign
+   * in.
+   */
+  async function runConnectFlow(domain: 'feishu' | 'lark', force: boolean, signal: AbortSignal): Promise<void> {
+    const current = await lark.status(signal).catch(() => undefined)
+    if (!force && current?.connected === true) {
+      await recordIdentity(current)
+      setState({ phase: 'connected', message: await connectedMessage(current) })
+      return
+    }
+    // Forced switch: drop the existing user session but keep the app.
+    if (force && current !== undefined) await lark.logout(signal)
+
+    // Reuse an already-created app when possible; only register when we must.
+    const appConfigured = (await ctx.credentials.describe(appIdRef)).configured
+    if (appConfigured && await authorizeReusingApp(signal)) return
+
+    await registerAndAuthorize(domain, signal)
+  }
+
+  function startConnect(domain: 'feishu' | 'lark', force: boolean): void {
     flowAbort?.abort()
     const controller = new AbortController()
     flowAbort = controller
-    setState({ phase: 'creating', message: 'Starting one-click app creation…' })
-    runConnectFlow(domain, controller.signal).catch((error: unknown) => {
+    setState({ phase: 'creating', message: 'Checking existing Feishu connection…' })
+    runConnectFlow(domain, force, controller.signal).catch((error: unknown) => {
       if (controller.signal.aborted) return
       setState({ phase: 'error', message: error instanceof Error ? error.message : String(error) })
     })
@@ -189,6 +261,18 @@ export function apply(ctx: Context, config: Config) {
       userAuthorized = status?.connected ?? false
     } catch { /* lark-cli not ready yet → not authorized */ }
     return { appConfigured: app.configured, userAuthorized }
+  }
+
+  /**
+   * Merge live flow state with configured/authorized truth. After a restart the
+   * in-memory phase is `idle` but lark-cli may still hold a valid session, so
+   * normalize that to `connected` for an honest snapshot.
+   */
+  async function fullStatus() {
+    const configured = await describeConfigured()
+    const snapshot = statusSnapshot()
+    const phase = snapshot.phase === 'idle' && configured.userAuthorized ? 'connected' as const : snapshot.phase
+    return { ...snapshot, phase, ...configured }
   }
 
   /** Fail domain tools early with an actionable message when not connected. */
@@ -246,13 +330,21 @@ export function apply(ctx: Context, config: Config) {
     name: 'feishu_connect',
     description: 'Connect Feishu (Lark) with one-click onboarding: creates a Feishu app with all needed '
       + 'permissions pre-granted and starts personal (device-code) authorization. Returns a link the user '
-      + 'opens in a browser — show it to the user, then follow the flow with feishu_status. Use when the '
-      + 'user wants to connect Feishu or a Feishu tool reports missing credentials.',
+      + 'opens in a browser — show it to the user, then follow the flow with feishu_status. Idempotent: if '
+      + 'Feishu is already connected it returns connected with no link, and a returning user who only needs '
+      + 'to re-authorize gets a single link (the existing app is reused). Pass force=true to re-authorize as '
+      + 'a different account. Use when the user wants to connect Feishu or a Feishu tool reports missing '
+      + 'credentials.',
     parameters: {
       domain: {
         type: 'string',
         enum: ['feishu', 'lark'],
         description: 'feishu = China (default), lark = international tenants',
+      },
+      force: {
+        type: 'boolean',
+        description: 'Re-run personal authorization even if already connected, to switch account '
+          + '(reuses the existing app). Default false: reuse the current connection.',
       },
     },
     output: {
@@ -260,12 +352,13 @@ export function apply(ctx: Context, config: Config) {
       render: (_args, value) => renderStatus(value),
     },
     async execute(args) {
-      startConnect(args.domain ?? 'feishu')
-      // Wait for the begin call to produce the confirm link (or fail fast).
+      startConnect(args.domain ?? 'feishu', args.force ?? false)
+      // Wait until the flow leaves the initial check: a link appears, it
+      // short-circuits to connected, or it fails.
       for (let i = 0; i < 100 && state.phase === 'creating' && state.qrUrl === undefined; i++) {
         await new Promise((resolve) => setTimeout(resolve, 200))
       }
-      return { ...statusSnapshot(), ...await describeConfigured() }
+      return await fullStatus()
     },
   }))
 
@@ -296,7 +389,7 @@ export function apply(ctx: Context, config: Config) {
           }, { once: true })
         })
       }
-      return { ...statusSnapshot(), ...await describeConfigured() }
+      return await fullStatus()
     },
   }))
 
@@ -416,16 +509,29 @@ export function apply(ctx: Context, config: Config) {
   ctx.inject(['commands'], (commandCtx) => {
     commandCtx.commands.register({
       name: 'feishu-connect',
-      description: 'One-click Feishu connection: creates the app and starts personal device-code authorization.',
-      input: { hint: '[lark]' },
+      description: 'One-click Feishu connection: reuses an existing connection, or creates the app and starts '
+        + 'personal device-code authorization. Add "force" to re-authorize as a different account.',
+      input: { hint: '[lark] [force]' },
       async handler({ rawInput }) {
-        const domain = rawInput.trim().toLowerCase() === 'lark' ? 'lark' : 'feishu'
-        startConnect(domain)
+        const tokens = rawInput.trim().toLowerCase().split(/\s+/).filter(Boolean)
+        const domain = tokens.includes('lark') ? 'lark' : 'feishu'
+        const force = tokens.includes('force')
+        startConnect(domain, force)
         for (let i = 0; i < 100 && state.phase === 'creating' && state.qrUrl === undefined; i++) {
           await new Promise((resolve) => setTimeout(resolve, 200))
         }
         if (state.phase === 'error') {
           return { kind: 'error', text: state.message ?? 'Feishu connection failed' }
+        }
+        if (state.phase === 'connected') {
+          return { kind: 'success', text: state.message ?? 'Feishu is already connected.' }
+        }
+        if (state.authorizeUrl !== undefined) {
+          return {
+            kind: 'success',
+            text: `Open this link and confirm to grant personal authorization:\n${state.authorizeUrl}\n`
+              + 'Then run /feishu-status to finish.',
+          }
         }
         return {
           kind: 'success',
@@ -439,9 +545,7 @@ export function apply(ctx: Context, config: Config) {
       name: 'feishu-status',
       description: 'Show Feishu connection progress and any link waiting for you.',
       async handler() {
-        const configured = await describeConfigured()
-        const snapshot = statusSnapshot()
-        const text = renderStatus({ ...snapshot, ...configured })
+        const text = renderStatus(await fullStatus())
           .map((block) => block.text).join('\n')
         return { kind: 'success', text }
       },
