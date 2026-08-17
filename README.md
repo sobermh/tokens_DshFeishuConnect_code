@@ -35,18 +35,22 @@ pnpm dsh --profile <名字> --dump-config
 2. 插件自动下载校验官方 lark-cli（首次约 12 MB，存 `~/.dsh/runtime/lark-cli/`），用创建好的应用凭据初始化一个命名 profile，随即给出**第二个链接**做个人设备码授权；
 3. 浏览器打开第二个链接确认后，lark-cli 把 user token 存入系统钥匙串，完成。登录一次，重启免重扫。
 
+**幂等复用**：连接以 lark-cli 的登录态为唯一真相源。已连接时再调 `feishu_connect` 直接返回「已连接」，不重复建应用；应用已建、只是要重新授权时，只出**那一个**个人授权链接（复用已有应用）——只有第一次连接才会出两个链接。要**换账号**，加 `force`（`/feishu-connect force`，或工具参数 `force: true`）重新走个人授权。
+
+> user token 只由 lark-cli 保管在系统钥匙串（唯一真相源）。插件另在 `~/.dsh/runtime/lark-cli/<profile>.identity.json` 存一份**非密钥**身份元数据（用户名、open_id、profile、连接时间），供重启后识别与其他工具复用；有效性仍实时以 lark-cli `auth status` 为准。
+
 之后 `feishu_create_doc` / `feishu_send_message` / `feishu_create_bitable` 等工具以你个人身份操作。
 
 ## 工具与命令
 
 | 名称 | 说明 |
 |---|---|
-| `feishu_connect` 工具 | 发起一键创建 + 设备码授权流程，返回链接 |
+| `feishu_connect` 工具 | 发起/复用连接：幂等，已连接直接返回；`force` 换账号 |
 | `feishu_status` 工具 | 长轮询流程进度（agent 用它跟进并转发链接） |
 | `feishu_create_doc` 工具 | 新建 docx 文档，返回 id 和 URL |
 | `feishu_send_message` 工具 | 发文本消息（open_id / chat_id / email / user_id） |
 | `feishu_create_bitable` 工具 | 新建多维表格（Base），返回 app_token 和 URL |
-| `/feishu-connect [lark]` 命令 | 人类直接发起流程（`lark` = 国际版） |
+| `/feishu-connect [lark] [force]` 命令 | 人类直接发起流程（`lark` = 国际版；`force` = 换账号） |
 | `/feishu-status` 命令 | 查看进度和待打开的链接 |
 
 ## 源码结构
@@ -55,7 +59,8 @@ pnpm dsh --profile <名字> --dump-config
 - `src/scopes.ts` — 预授权 scope 清单（tenant + user；不含需管理员审批的 self_manage/patch）
 - `src/larkcli-provision.ts` — 锁版直连 GitHub release 下载 lark-cli + 双重 SHA-256 校验 + 自带 zip/tar.gz 解包
 - `src/larkcli.ts` — lark-cli 运行器：设备码登录、状态查询、`lark-cli api` 通用透传
-- `src/index.ts` — 插件入口：工具与命令注册、连接状态机、凭据管理
+- `src/identity.ts` — 连接身份元数据缓存（非密钥；重启识别、跨工具复用 profile）
+- `src/index.ts` — 插件入口：工具与命令注册、连接状态机（幂等复用 + `force` 换账号）、凭据管理
 
 ## 开发
 
