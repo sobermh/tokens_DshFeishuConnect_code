@@ -1,14 +1,16 @@
 /**
- * Feishu (Lark) connectivity plugin with one-click onboarding. The model
- * drives the whole connection: `feishu_connect` starts the TokensAgent-style
- * one-click app creation (the user opens ONE link, confirms, and the Feishu
- * app is created with the full scope grant pre-filled), the plugin then
- * auto-configures the OAuth redirect, catches the personal-authorization
- * callback on localhost, and stores every credential. `feishu_status`
- * long-polls the flow so the agent can walk the user through it. Domain
- * tools (`feishu_create_doc`, `feishu_send_message`) authenticate with the
- * personal user token (auto-refreshed) or fall back to the tenant token.
- * `/feishu-connect` and `/feishu-status` expose the same flow to humans.
+ * Feishu (Lark) connectivity plugin with true one-click onboarding. The whole
+ * connection is model- or human-driven and needs no developer-console visit:
+ * `feishu_connect` starts the TokensAgent-style one-click app creation (the
+ * user opens ONE link and confirms; the Feishu app is created with the full
+ * scope grant pre-filled), then the plugin provisions the official Larksuite
+ * CLI (pinned, SHA-256-verified) and drives its built-in device-code login —
+ * the user opens a SECOND link, authorizes, and lark-cli stores the personal
+ * user token in the OS keychain. No redirect URL, no whitelist, no admin
+ * approval. Domain tools (`feishu_create_doc`, `feishu_send_message`,
+ * `feishu_create_bitable`) then act as that personal identity through the
+ * generic `lark-cli api` passthrough. `/feishu-connect` and `/feishu-status`
+ * expose the same flow to humans.
  * @module @tokens/feishu
  */
 
@@ -17,54 +19,36 @@ import Schema from '@deepseek-ai/schemastery'
 import type {} from '@deepseek-ai/dsh-commands'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import { defineTool } from '@deepseek-ai/dsh-tools'
-import {
-  buildAuthorizeUrl,
-  createDocument,
-  exchangeUserToken,
-  fetchTenantToken,
-  refreshUserToken,
-  sendTextMessage,
-} from './api.ts'
-import type { FeishuAuth, FeishuClientOptions } from './api.ts'
-import { startCallbackServer } from './oauth-server.ts'
-import { beginRegistration, configureOAuthRedirect, pollRegistration } from './register.ts'
+import { beginRegistration, pollRegistration } from './register.ts'
 import { TENANT_SCOPES, USER_SCOPES } from './scopes.ts'
+import { createLarkcli } from './larkcli.ts'
 
 export const name = 'feishu'
 export const inject = ['tools', 'credentials']
 
 /** Plugin config: credential references and endpoints, never secret values. */
 export interface Config {
-  /** Credential reference for the Feishu app id. */
+  /** Credential reference for the created Feishu app id. */
   appIdEnv: string
-  /** Credential reference for the Feishu app secret. */
+  /** Credential reference for the created Feishu app secret. */
   appSecretEnv: string
-  /** Credential reference for the personal user access token. */
-  userTokenEnv: string
-  /** Credential reference for the personal refresh token. */
-  refreshTokenEnv: string
-  /** Credential reference recording the user token's expiry (epoch ms). */
-  tokenExpiresEnv: string
   /** OpenAPI origin; `https://open.larksuite.com` for international tenants. */
   baseURL: string
-  /** Localhost port that catches the personal-authorization redirect. */
-  oauthPort: number
   /** App name preset onto the one-click creation confirm page. */
   appName: string
   /** App description preset onto the one-click creation confirm page. */
   appDesc: string
+  /** lark-cli profile the app credentials and user session live under. */
+  profile: string
 }
 
 export const Config: Schema<Config> = Schema.object({
   appIdEnv: Schema.string().role('credential-ref').default('FEISHU_APP_ID'),
   appSecretEnv: Schema.string().role('credential-ref').default('FEISHU_APP_SECRET'),
-  userTokenEnv: Schema.string().role('credential-ref').default('FEISHU_USER_TOKEN'),
-  refreshTokenEnv: Schema.string().role('credential-ref').default('FEISHU_REFRESH_TOKEN'),
-  tokenExpiresEnv: Schema.string().role('credential-ref').default('FEISHU_TOKEN_EXPIRES_AT'),
   baseURL: Schema.string().default('https://open.feishu.cn'),
-  oauthPort: Schema.number().step(1).min(1).max(65535).default(3000),
   appName: Schema.string().default('TokensAgent'),
   appDesc: Schema.string().default('DeepSeek Harness · Feishu connector'),
+  profile: Schema.string().default('dsh-feishu'),
 })
 
 /** Connection-flow phase visible to the agent and the user. */
@@ -74,7 +58,7 @@ interface ConnectState {
   phase: ConnectPhase
   /** One-click creation confirm link (phase `creating`). */
   qrUrl?: string | undefined
-  /** Personal-authorization link (phase `authorizing`). */
+  /** Device-code authorization link (phase `authorizing`). */
   authorizeUrl?: string | undefined
   /** User-facing progress or error message. */
   message?: string | undefined
@@ -85,16 +69,12 @@ interface ConnectState {
 export function apply(ctx: Context, config: Config) {
   const appIdRef = credentialRef(config.appIdEnv)
   const appSecretRef = credentialRef(config.appSecretEnv)
-  const userTokenRef = credentialRef(config.userTokenEnv)
-  const refreshTokenRef = credentialRef(config.refreshTokenEnv)
-  const tokenExpiresRef = credentialRef(config.tokenExpiresEnv)
-  const redirectUri = `http://localhost:${config.oauthPort}/callback`
+  const lark = createLarkcli({ profile: config.profile, baseURL: config.baseURL })
 
   // ---- connection-flow state machine (one flow at a time) -----------------
 
   const state: ConnectState = { phase: 'idle' }
   let flowAbort: AbortController | undefined
-  let closeServer: (() => void) | undefined
   const phaseWaiters = new Set<() => void>()
 
   function setState(next: Partial<ConnectState> & { phase: ConnectPhase }): void {
@@ -107,11 +87,8 @@ export function apply(ctx: Context, config: Config) {
     phaseWaiters.clear()
   }
 
-  // Plugin disposal cancels any in-flight flow and frees the callback port.
-  ctx.effect(() => () => {
-    flowAbort?.abort()
-    closeServer?.()
-  })
+  // Plugin disposal cancels any in-flight flow.
+  ctx.effect(() => () => { flowAbort?.abort() })
 
   function sleep(ms: number, signal: AbortSignal): Promise<void> {
     return new Promise((resolve, reject) => {
@@ -153,7 +130,7 @@ export function apply(ctx: Context, config: Config) {
       setState({
         phase: 'creating',
         qrUrl: session.qrUrl,
-        message: 'App created; configuring authorization…',
+        message: 'App created; preparing the local authorization tool…',
         ...outcome.openId === undefined ? {} : { openId: outcome.openId },
       })
       break
@@ -162,40 +139,30 @@ export function apply(ctx: Context, config: Config) {
     await ctx.credentials.set(appIdRef, appId)
     await ctx.credentials.set(appSecretRef, appSecret)
 
-    // Programmatically add the localhost callback so personal OAuth works
-    // without a developer-console visit (needs application:application:patch).
-    const tenantToken = await fetchTenantToken(config.baseURL, appId, appSecret, signal)
-    await configureOAuthRedirect(config.baseURL, tenantToken, appId, redirectUri, signal)
+    // Provision the pinned lark-cli binary (first run downloads ~12 MB) and
+    // bind the created app's credentials to the profile.
+    await lark.provision()
+    await lark.configInit(appId, appSecret, signal)
 
-    // Catch the single personal-authorization redirect on localhost.
-    const server = await startCallbackServer(config.oauthPort)
-    closeServer = server.close
-    signal.addEventListener('abort', server.close, { once: true })
+    // Drive lark-cli's built-in device-code login: it returns the second link
+    // for the user to open, then blocks until they authorize in the browser.
+    const begin = await lark.loginBegin(signal)
     setState({
       phase: 'authorizing',
-      authorizeUrl: buildAuthorizeUrl(config.baseURL, appId, redirectUri),
-      message: 'App created. Waiting for the user to open the authorization link.',
+      authorizeUrl: begin.verificationUrl,
+      message: 'App created. Open this link and confirm to grant your personal Feishu identity.',
     })
-
-    try {
-      const code = await server.code
-      const grant = await exchangeUserToken(config.baseURL, appId, appSecret, code, redirectUri, signal)
-      await storeGrant(grant.token, grant.refreshToken, grant.expiresIn)
-      setState({ phase: 'connected', message: 'Feishu is connected with your personal identity.' })
-    } finally {
-      closeServer = undefined
-    }
-  }
-
-  async function storeGrant(token: string, refreshToken: string | undefined, expiresIn: number): Promise<void> {
-    await ctx.credentials.set(userTokenRef, token)
-    if (refreshToken !== undefined) await ctx.credentials.set(refreshTokenRef, refreshToken)
-    await ctx.credentials.set(tokenExpiresRef, String(Date.now() + expiresIn * 1000))
+    const status = await lark.loginComplete(begin.deviceCode, signal)
+    setState({
+      phase: 'connected',
+      message: status.userName === undefined
+        ? 'Feishu is connected with your personal identity.'
+        : `Feishu is connected as ${status.userName}.`,
+    })
   }
 
   function startConnect(domain: 'feishu' | 'lark'): void {
     flowAbort?.abort()
-    closeServer?.()
     const controller = new AbortController()
     flowAbort = controller
     setState({ phase: 'creating', message: 'Starting one-click app creation…' })
@@ -216,59 +183,28 @@ export function apply(ctx: Context, config: Config) {
 
   async function describeConfigured(): Promise<{ appConfigured: boolean; userAuthorized: boolean }> {
     const app = await ctx.credentials.describe(appIdRef)
-    const user = await ctx.credentials.describe(userTokenRef)
-    return { appConfigured: app.configured, userAuthorized: user.configured }
+    let userAuthorized = false
+    try {
+      const status = await lark.status()
+      userAuthorized = status?.connected ?? false
+    } catch { /* lark-cli not ready yet → not authorized */ }
+    return { appConfigured: app.configured, userAuthorized }
   }
 
-  // ---- request authentication --------------------------------------------
-
-  // Tenant tokens live ~2h; cache one in memory. The personal token is
-  // provider-stored and re-resolved per request, refreshed ahead of expiry.
-  let tenantCache: { token: string; expiresAt: number } | undefined
-
-  async function resolveAppSecrets(): Promise<{ appId: string; appSecret: string }> {
-    const appId = (await ctx.credentials.resolve(appIdRef))?.value
-    const appSecret = (await ctx.credentials.resolve(appSecretRef))?.value
-    if (appId === undefined || appSecret === undefined) {
+  /** Fail domain tools early with an actionable message when not connected. */
+  async function assertConnected(signal: AbortSignal): Promise<void> {
+    let status
+    try {
+      status = await lark.status(signal)
+    } catch {
+      status = undefined
+    }
+    if (status?.connected !== true) {
       throw new Error(
         'Feishu is not connected yet. Call the feishu_connect tool (or run /feishu-connect) '
         + 'to create and authorize a Feishu app in one click.',
       )
     }
-    return { appId, appSecret }
-  }
-
-  async function resolveUserToken(): Promise<string | undefined> {
-    const token = (await ctx.credentials.resolve(userTokenRef))?.value
-    if (token === undefined) return undefined
-    const expiresAtRaw = (await ctx.credentials.resolve(tokenExpiresRef))?.value
-    const expiresAt = expiresAtRaw === undefined ? undefined : Number(expiresAtRaw)
-    const stillValid = expiresAt === undefined || Number.isNaN(expiresAt)
-      || Date.now() < expiresAt - 5 * 60 * 1000
-    if (stillValid) return token
-
-    const refreshToken = (await ctx.credentials.resolve(refreshTokenRef))?.value
-    if (refreshToken === undefined) return undefined
-    const { appId, appSecret } = await resolveAppSecrets()
-    const grant = await refreshUserToken(config.baseURL, appId, appSecret, refreshToken)
-    await storeGrant(grant.token, grant.refreshToken, grant.expiresIn)
-    return grant.token
-  }
-
-  async function resolveAuth(): Promise<FeishuAuth> {
-    const user = await resolveUserToken()
-    if (user !== undefined) return { token: user, kind: 'user' }
-    if (tenantCache !== undefined && tenantCache.expiresAt > Date.now()) {
-      return { token: tenantCache.token, kind: 'tenant' }
-    }
-    const { appId, appSecret } = await resolveAppSecrets()
-    const token = await fetchTenantToken(config.baseURL, appId, appSecret)
-    tenantCache = { token, expiresAt: Date.now() + 90 * 60 * 1000 }
-    return { token, kind: 'tenant' }
-  }
-
-  function clientOptions(signal: AbortSignal): FeishuClientOptions {
-    return { baseURL: config.baseURL, resolveAuth, signal }
   }
 
   // ---- connection tools (the model drives the onboarding) ----------------
@@ -299,7 +235,7 @@ export function apply(ctx: Context, config: Config) {
       lines.push(`Ask the user to open this link to create the app in one click: ${value.qrUrl}`)
     }
     if (value.authorizeUrl !== null && value.phase === 'authorizing') {
-      lines.push(`Ask the user to open this link to grant personal authorization: ${value.authorizeUrl}`)
+      lines.push(`Ask the user to open this link and confirm to grant personal authorization: ${value.authorizeUrl}`)
     }
     if (value.message !== null) lines.push(value.message)
     lines.push(`app configured: ${value.appConfigured}, personal identity authorized: ${value.userAuthorized}`)
@@ -309,9 +245,9 @@ export function apply(ctx: Context, config: Config) {
   ctx.tools.register(defineTool({
     name: 'feishu_connect',
     description: 'Connect Feishu (Lark) with one-click onboarding: creates a Feishu app with all needed '
-      + 'permissions pre-granted and starts personal authorization. Returns a link the user opens in a '
-      + 'browser — show it to the user, then follow the flow with feishu_status. Use when the user wants '
-      + 'to connect Feishu or a Feishu tool reports missing credentials.',
+      + 'permissions pre-granted and starts personal (device-code) authorization. Returns a link the user '
+      + 'opens in a browser — show it to the user, then follow the flow with feishu_status. Use when the '
+      + 'user wants to connect Feishu or a Feishu tool reports missing credentials.',
     parameters: {
       domain: {
         type: 'string',
@@ -364,7 +300,7 @@ export function apply(ctx: Context, config: Config) {
     },
   }))
 
-  // ---- domain tools -------------------------------------------------------
+  // ---- domain tools (act as the personal identity via `lark-cli api`) -----
 
   ctx.tools.register(defineTool({
     name: 'feishu_create_doc',
@@ -387,7 +323,16 @@ export function apply(ctx: Context, config: Config) {
       render: (_args, value) => [{ type: 'text', text: `Created Feishu doc "${value.title}": ${value.url}` }],
     },
     async execute(args, exec) {
-      return createDocument(clientOptions(exec.signal), args.title, args.folder_token)
+      await assertConnected(exec.signal)
+      const data = await lark.api<{ document: { document_id: string; title: string } }>(
+        'POST',
+        '/open-apis/docx/v1/documents',
+        { as: 'user', data: { title: args.title, ...args.folder_token === undefined ? {} : { folder_token: args.folder_token } } },
+        exec.signal,
+      )
+      const documentId = data.document.document_id
+      const origin = new URL(config.baseURL).origin.replace('open.', '')
+      return { documentId, title: data.document.title, url: `${origin}/docx/${documentId}` }
     },
   }))
 
@@ -414,7 +359,55 @@ export function apply(ctx: Context, config: Config) {
       render: (_args, value) => [{ type: 'text', text: `Sent Feishu message ${value.messageId}` }],
     },
     async execute(args, exec) {
-      return sendTextMessage(clientOptions(exec.signal), args.receive_id_type, args.receive_id, args.text)
+      await assertConnected(exec.signal)
+      const data = await lark.api<{ message_id: string }>(
+        'POST',
+        '/open-apis/im/v1/messages',
+        {
+          as: 'user',
+          params: { receive_id_type: args.receive_id_type },
+          data: { receive_id: args.receive_id, msg_type: 'text', content: JSON.stringify({ text: args.text }) },
+        },
+        exec.signal,
+      )
+      return { messageId: data.message_id }
+    },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'feishu_create_bitable',
+    description: 'Create a new Feishu Base (多维表格 / Bitable) app and return its token and URL. '
+      + 'If Feishu is not connected yet, use feishu_connect first.',
+    parameters: {
+      name: { type: 'string', required: true, description: 'Base name' },
+      folder_token: { type: 'string', description: 'Destination folder token; omit for the root folder' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        properties: {
+          appToken: { type: 'string', required: true },
+          name: { type: 'string', required: true },
+          url: { type: 'string', required: true },
+        },
+        additionalProperties: false,
+      },
+      render: (_args, value) => [{ type: 'text', text: `Created Feishu Base "${value.name}": ${value.url}` }],
+    },
+    async execute(args, exec) {
+      await assertConnected(exec.signal)
+      const data = await lark.api<{ app: { app_token: string; name?: string; url?: string; folder_token?: string } }>(
+        'POST',
+        '/open-apis/bitable/v1/apps',
+        { as: 'user', data: { name: args.name, ...args.folder_token === undefined ? {} : { folder_token: args.folder_token } } },
+        exec.signal,
+      )
+      const origin = new URL(config.baseURL).origin.replace('open.', '')
+      return {
+        appToken: data.app.app_token,
+        name: data.app.name ?? args.name,
+        url: data.app.url ?? `${origin}/base/${data.app.app_token}`,
+      }
     },
   }))
 
@@ -423,7 +416,7 @@ export function apply(ctx: Context, config: Config) {
   ctx.inject(['commands'], (commandCtx) => {
     commandCtx.commands.register({
       name: 'feishu-connect',
-      description: 'One-click Feishu connection: creates the app and starts personal authorization.',
+      description: 'One-click Feishu connection: creates the app and starts personal device-code authorization.',
       input: { hint: '[lark]' },
       async handler({ rawInput }) {
         const domain = rawInput.trim().toLowerCase() === 'lark' ? 'lark' : 'feishu'
@@ -436,7 +429,7 @@ export function apply(ctx: Context, config: Config) {
         }
         return {
           kind: 'success',
-          text: `Open this link to create and authorize the Feishu app in one click:\n${state.qrUrl ?? '(pending…)'}\n`
+          text: `Open this link to create the Feishu app in one click:\n${state.qrUrl ?? '(pending…)'}\n`
             + 'Then run /feishu-status to follow the flow (a second link completes personal authorization).',
         }
       },

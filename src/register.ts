@@ -190,38 +190,3 @@ export async function pollRegistration(
       return { status: 'error', message: `${res.error}: ${res.error_description ?? ''}` }
   }
 }
-
-/**
- * Write the local OAuth callback URL into the new app's security settings so
- * personal authorization works without a developer-console visit. Requires the
- * `application:application:patch` tenant scope granted at creation;
- * redirect-URL changes apply immediately without app review.
- * @param baseURL - OpenAPI origin.
- * @param tenantToken - tenant access token of the app itself.
- * @param appId - the app to configure.
- * @param redirectUri - callback URL to add.
- * @param signal - abort signal.
- */
-export async function configureOAuthRedirect(
-  baseURL: string,
-  tenantToken: string,
-  appId: string,
-  redirectUri: string,
-  signal?: AbortSignal,
-): Promise<void> {
-  const response = await fetch(new URL(`/open-apis/application/v7/applications/${appId}/config`, baseURL), {
-    method: 'PATCH',
-    headers: {
-      'content-type': 'application/json; charset=utf-8',
-      'authorization': `Bearer ${tenantToken}`,
-    },
-    body: JSON.stringify({
-      security: { add: { redirect_urls: [redirectUri] }, allow_refresh_token: true },
-    }),
-    ...signal === undefined ? {} : { signal },
-  })
-  const payload = await response.json() as { code?: number; msg?: string }
-  if (payload.code !== 0) {
-    throw new Error(`Feishu app config patch failed: code=${payload.code} msg=${payload.msg}`)
-  }
-}

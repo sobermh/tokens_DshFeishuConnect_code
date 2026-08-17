@@ -4,5 +4,4 @@
       config:
         appIdEnv: FEISHU_APP_ID
         appSecretEnv: FEISHU_APP_SECRET
-        userTokenEnv: FEISHU_USER_TOKEN
         baseURL: https://open.feishu.cn
