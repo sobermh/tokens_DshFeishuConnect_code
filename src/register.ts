@@ -194,7 +194,7 @@ export async function pollRegistration(
 /**
  * Write the local OAuth callback URL into the new app's security settings so
  * personal authorization works without a developer-console visit. Requires the
- * `application:application:self_manage` tenant scope granted at creation;
+ * `application:application:patch` tenant scope granted at creation;
  * redirect-URL changes apply immediately without app review.
  * @param baseURL - OpenAPI origin.
  * @param tenantToken - tenant access token of the app itself.

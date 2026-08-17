@@ -163,7 +163,7 @@ export function apply(ctx: Context, config: Config) {
     await ctx.credentials.set(appSecretRef, appSecret)
 
     // Programmatically add the localhost callback so personal OAuth works
-    // without a developer-console visit (needs application:application:self_manage).
+    // without a developer-console visit (needs application:application:patch).
     const tenantToken = await fetchTenantToken(config.baseURL, appId, appSecret, signal)
     await configureOAuthRedirect(config.baseURL, tenantToken, appId, redirectUri, signal)
 

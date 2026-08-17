@@ -6,10 +6,16 @@
  * @module
  */
 
-/** Tenant (bot) scopes. `application:application:self_manage` lets the plugin patch its own redirect URLs. */
+/**
+ * Tenant (bot) scopes. `application:application:patch` lets the plugin PATCH
+ * its own config (redirect URLs) right after creation; `self_manage` is kept
+ * for broader self-administration. The redirect-URL patch fails with
+ * `[application:application:patch]` if the former is missing.
+ */
 export const TENANT_SCOPES: readonly string[] = [
   'application:app_slash_command:read',
   'application:app_slash_command:write',
+  'application:application:patch',
   'application:application:self_manage',
   'application:bot.basic_info:read',
   'application:bot.menu:write',
