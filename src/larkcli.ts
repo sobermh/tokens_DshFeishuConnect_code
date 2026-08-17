@@ -183,10 +183,19 @@ export function createLarkcli(options: LarkcliOptions) {
       await ensureLarkcli()
     },
 
-    /** Bind the created app's credentials to the profile (secret via stdin). */
+    /**
+     * Bind the created app's credentials to the profile (secret via stdin).
+     *
+     * `--force-init` is required because lark-cli v1.0.76 refuses `config init`
+     * whenever it detects an "Agent context" (the ambient `HERMES_HOME` or
+     * `OPENCLAW_HOME` env var, e.g. a personal Hermes install on the machine),
+     * to avoid shadowing that agent's own binding. We deliberately want our own
+     * app — the one one-click registration just minted — so we take the CLI's
+     * documented escape hatch and pin every later call to our named profile.
+     */
     async configInit(appId: string, appSecret: string, signal?: AbortSignal): Promise<void> {
       const result = await run(
-        ['config', 'init', '--app-id', appId, '--app-secret-stdin', '--brand', 'feishu', '--name', profile],
+        ['config', 'init', '--app-id', appId, '--app-secret-stdin', '--brand', 'feishu', '--name', profile, '--force-init'],
         { stdin: appSecret, signal },
       )
       ensureOk(result, 'config init')
@@ -196,7 +205,10 @@ export function createLarkcli(options: LarkcliOptions) {
 
     /** Begin the device-code login; returns the link and code to poll. */
     async loginBegin(signal?: AbortSignal): Promise<LoginBegin> {
-      const result = await run(['auth', 'login', '--no-wait', '--json', '--domain', LOGIN_DOMAINS], { signal })
+      const result = await run(
+        ['auth', 'login', '--no-wait', '--json', '--domain', LOGIN_DOMAINS, '--profile', profile],
+        { signal },
+      )
       ensureOk(result, 'auth login')
       const map = larkcliJSON(result.stdout)
       const verificationUrl = asString(map['verification_url'])
@@ -210,7 +222,7 @@ export function createLarkcli(options: LarkcliOptions) {
     /** Wait for the user to authorize in the browser and finish the login. */
     async loginComplete(deviceCode: string, signal?: AbortSignal): Promise<AuthStatus> {
       const result = await run(
-        ['auth', 'login', '--device-code', deviceCode, '--json'],
+        ['auth', 'login', '--device-code', deviceCode, '--json', '--profile', profile],
         { signal, timeoutMs: LOGIN_COMPLETE_TIMEOUT_MS },
       )
       ensureOk(result, 'auth login (device-code)')
@@ -220,7 +232,7 @@ export function createLarkcli(options: LarkcliOptions) {
     /** Report the current user-identity connection state, or `undefined` if lark-cli is not installed. */
     async status(signal?: AbortSignal): Promise<AuthStatus | undefined> {
       if ((await larkcliPath()) === undefined) return undefined
-      const result = await run(['auth', 'status', '--json'], { signal })
+      const result = await run(['auth', 'status', '--json', '--profile', profile], { signal })
       // `auth status` exits non-zero when logged out; the JSON still describes that.
       try {
         return statusFromMap(larkcliJSON(result.stdout || result.stderr))
@@ -231,7 +243,8 @@ export function createLarkcli(options: LarkcliOptions) {
 
     /** Clear the stored user session. */
     async logout(signal?: AbortSignal): Promise<void> {
-      await run(['auth', 'logout', '--json'], { signal }).catch(() => { /* logging out while logged out is fine */ })
+      await run(['auth', 'logout', '--json', '--profile', profile], { signal })
+        .catch(() => { /* logging out while logged out is fine */ })
     },
 
     /**
@@ -244,7 +257,7 @@ export function createLarkcli(options: LarkcliOptions) {
       opts: { params?: unknown; data?: unknown; as?: 'user' | 'bot' } = {},
       signal?: AbortSignal,
     ): Promise<T> {
-      const args = ['api', method, path, '--as', opts.as ?? 'user', '--format', 'json']
+      const args = ['api', method, path, '--as', opts.as ?? 'user', '--format', 'json', '--profile', profile]
       if (opts.params !== undefined) args.push('--params', JSON.stringify(opts.params))
       if (opts.data !== undefined) args.push('--data', JSON.stringify(opts.data))
       const result = await run(args, { signal })
