@@ -1,0 +1,15 @@
+{
+  "name": "@tokens/feishu",
+  "description": "Feishu (Lark) connector bundle: one-click app creation + personal OAuth, doc/message tools. Local dev, not published.",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./cordis.patch.yml": "./cordis.patch.yml"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

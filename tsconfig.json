@@ -1,0 +1,20 @@
+{
+  // Local plugin project: typechecks against workspace sources with `tsc -b`,
+  // resolving workspace imports through referenced projects like packages/ do.
+  // Not part of the root solution.
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "lib/types"
+  },
+  "include": [
+    "src"
+  ],
+  "references": [
+    { "path": "../../vendor/cordis" },
+    { "path": "../../vendor/schemastery" },
+    { "path": "../../packages/core/tools" },
+    { "path": "../../packages/credentials/credentials" },
+    { "path": "../../packages/interaction/commands" }
+  ]
+}
