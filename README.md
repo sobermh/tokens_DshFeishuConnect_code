@@ -29,7 +29,7 @@ pnpm dsh --profile <名字> --dump-config
 
 对 agent 说「帮我连上飞书」，或直接敲 `/feishu-connect`：
 
-1. 插件返回**一个链接**，浏览器打开（可扫码），确认后飞书自动创建应用「DSH Agent」，全部 scope 预授权；
+1. 插件返回**一个链接**，浏览器打开（可扫码），确认后飞书自动创建应用「TokensAgent」，全部 scope 预授权；
 2. 插件自动把 `http://localhost:3000/callback` 写入应用安全设置，随即给出**第二个链接**做个人授权；
 3. 点开授权后浏览器重定向回本地，code 自动换成 user token 存入凭据系统，完成。
 

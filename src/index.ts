@@ -63,7 +63,7 @@ export const Config: Schema<Config> = Schema.object({
   tokenExpiresEnv: Schema.string().role('credential-ref').default('FEISHU_TOKEN_EXPIRES_AT'),
   baseURL: Schema.string().default('https://open.feishu.cn'),
   oauthPort: Schema.number().step(1).min(1).max(65535).default(3000),
-  appName: Schema.string().default('DSH Agent'),
+  appName: Schema.string().default('TokensAgent'),
   appDesc: Schema.string().default('DeepSeek Harness · Feishu connector'),
 })
 
