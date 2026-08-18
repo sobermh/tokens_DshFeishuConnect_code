@@ -125,11 +125,31 @@ export function apply(ctx: Context, config: Config) {
   }
 
   /**
+   * Re-bind the lark-cli profile from the app credentials already saved in the
+   * DSH credential store. Used when the app is known (its id/secret are stored)
+   * but the local lark-cli profile config was lost — e.g. `~/.lark-cli` was
+   * wiped — so we reuse the existing app instead of minting a new one and
+   * orphaning it. Returns `false` when the stored credentials are incomplete,
+   * so the caller falls back to a full registration.
+   */
+  async function rebindStoredApp(signal: AbortSignal): Promise<boolean> {
+    const id = await ctx.credentials.resolve(appIdRef)
+    const secret = await ctx.credentials.resolve(appSecretRef)
+    if (id === undefined || secret === undefined) return false
+    await lark.provision()
+    await lark.configInit(id.value, secret.value, signal)
+    return true
+  }
+
+  /**
    * Authorize against an app whose lark-cli profile config already persists
    * (created in an earlier run), so the user only opens the single device-code
-   * link. Returns `false` — without surfacing an error — when the profile is not
-   * bound yet (e.g. `~/.lark-cli` was wiped), so the caller falls back to a full
-   * registration. A genuine authorization failure still throws.
+   * link. When `loginBegin` fails because the profile config is missing (e.g.
+   * `~/.lark-cli` was wiped) the stored app credentials are used to re-bind the
+   * profile and the login is retried — reusing the same app rather than minting
+   * a new one. Returns `false` — without surfacing an error — only when the app
+   * cannot be reused at all (no stored credentials to re-bind), so the caller
+   * falls back to a full registration. A genuine authorization failure throws.
    */
   async function authorizeReusingApp(signal: AbortSignal): Promise<boolean> {
     await lark.provision()
@@ -137,7 +157,13 @@ export function apply(ctx: Context, config: Config) {
     try {
       begin = await lark.loginBegin(signal)
     } catch {
-      return false // profile not configured → re-register the app
+      // Profile config missing/corrupt: re-bind from stored creds, then retry.
+      if (!(await rebindStoredApp(signal))) return false
+      try {
+        begin = await lark.loginBegin(signal)
+      } catch {
+        return false
+      }
     }
     setState({
       phase: 'authorizing',
