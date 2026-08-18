@@ -1,16 +1,22 @@
 /**
- * Supply-chain-pinned acquisition of the official Larksuite CLI
+ * Self-maintaining acquisition of the official Larksuite CLI
  * (`github.com/larksuite/cli`). The connect flow drives lark-cli's built-in
  * device-code login, so the plugin must ship a verified copy of that native
- * binary. Ported from the TokensAgent `provision_binary.go` pin registry:
- * every platform maps to one pinned GitHub-release archive with a SHA-256 for
- * both the archive and the extracted binary. Nothing here is configurable —
- * changing a URL/hash/version is a reviewed code change, never plugin config.
+ * binary — and keep it current without a code change on every upstream release.
  *
- * Node has no built-in zip/tar reader and the plugin carries no dependencies,
- * so the two archive formats are unpacked by the minimal readers below. The
- * pinned binary SHA-256 is the authoritative gate: a tampered archive can never
- * produce bytes that match it, so the extractors only need to locate the entry.
+ * Instead of a hardcoded version + pinned hash, this tracks the latest GitHub
+ * release: resolve `releases/latest` → download that release's own
+ * `checksums.txt` → verify the platform archive's SHA-256 against it → extract
+ * → install atomically, stamping the installed tag so a cached binary is reused
+ * until a newer release appears (that is how "auto-update" happens). Integrity
+ * is gated by the release's signed-over-TLS checksum manifest rather than a
+ * baked-in constant; a `MIN_VERSION` floor rejects a downgrade. When the network
+ * is unavailable the already-installed binary is reused rather than failing.
+ *
+ * Node has no built-in zip/tar reader and the plugin carries no dependencies, so
+ * the two archive formats are unpacked by the minimal readers below. The
+ * checksum on the downloaded archive is the authoritative gate; the extractors
+ * only need to locate the entry.
  * @module
  */
 
@@ -21,158 +27,182 @@ import { arch, homedir, platform } from 'node:os'
 import { join } from 'node:path'
 import { gunzipSync, inflateRawSync } from 'node:zlib'
 
-/** One platform's pinned supply-chain metadata. */
-interface Pin {
-  /** Release version, for status messages. */
-  version: string
-  /** Pinned https download URL (github.com release asset). */
-  url: string
-  /** Expected SHA-256 (hex) of the downloaded archive. */
-  archiveSha256: string
-  /** Expected archive byte size. */
-  archiveSize: number
-  /** Archive container format. */
-  archiveFormat: 'zip' | 'tar.gz'
-  /** Name of the binary entry inside the archive. */
-  archiveEntry: string
-  /** Expected SHA-256 (hex) of the extracted binary. */
-  binarySha256: string
-  /** Expected binary byte size. */
-  binarySize: number
-  /** Filename to install the binary under. */
-  targetName: string
-  /** Hostnames the download (and its redirects) may resolve to. */
-  allowedHosts: readonly string[]
-}
+const REPO = 'larksuite/cli'
+const GITHUB_API = 'https://api.github.com'
+/** Hostnames any fetch (and its redirects) may resolve to. */
+const GITHUB_HOSTS = [
+  'api.github.com',
+  'github.com',
+  'objects.githubusercontent.com',
+  'release-assets.githubusercontent.com',
+] as const
 
-const RELEASE = 'https://github.com/larksuite/cli/releases/download/v1.0.76'
-const GITHUB_HOSTS = ['github.com', 'objects.githubusercontent.com', 'release-assets.githubusercontent.com'] as const
+/**
+ * Lowest release the plugin will install. Guards against an upstream downgrade
+ * or a poisoned "latest" pointing at an ancient tag; this is the last version
+ * the plugin was validated against. Bumping it is a reviewed code change.
+ */
+const MIN_VERSION = '1.0.76'
 
-/** Pinned lark-cli v1.0.76 releases, keyed by Node `${platform}-${arch}`. */
-const PINS: Record<string, Pin> = {
-  'win32-x64': {
-    version: 'v1.0.76',
-    url: `${RELEASE}/lark-cli-1.0.76-windows-amd64.zip`,
-    archiveSha256: 'cf59dcf3224a0753b1b11cae14f0513242ef7eab02f9c7d35c26427647ed6145',
-    archiveSize: 12702219,
-    archiveFormat: 'zip',
-    archiveEntry: 'lark-cli.exe',
-    binarySha256: 'f3a280bce52b8cc57d027385762c8f6379411eac500c83c49395d63645be759e',
-    binarySize: 44323840,
-    targetName: 'lark-cli.exe',
-    allowedHosts: GITHUB_HOSTS,
-  },
-  'linux-x64': {
-    version: 'v1.0.76',
-    url: `${RELEASE}/lark-cli-1.0.76-linux-amd64.tar.gz`,
-    archiveSha256: '759a676dde001bdc015384cfd741bcaca873329bbcaad8c4ea4a06acb49b3f42',
-    archiveSize: 12312501,
-    archiveFormat: 'tar.gz',
-    archiveEntry: 'lark-cli',
-    binarySha256: '21c25bbda5b7fdc9b8f5344954f69427042ec7a4e175d655c50515467553a92e',
-    binarySize: 43102360,
-    targetName: 'lark-cli',
-    allowedHosts: GITHUB_HOSTS,
-  },
-  'darwin-x64': {
-    version: 'v1.0.76',
-    url: `${RELEASE}/lark-cli-1.0.76-darwin-amd64.tar.gz`,
-    archiveSha256: 'f13c35b4a2a83d0c32b4ab3c223357cacffa341f621a112ca51e01f80826782a',
-    archiveSize: 12661985,
-    archiveFormat: 'tar.gz',
-    archiveEntry: 'lark-cli',
-    binarySha256: '6e44c38fb6771d9b885edfe36b29538471f050a01b0468155f49b62243a8a9e5',
-    binarySize: 44326848,
-    targetName: 'lark-cli',
-    allowedHosts: GITHUB_HOSTS,
-  },
-  'darwin-arm64': {
-    version: 'v1.0.76',
-    url: `${RELEASE}/lark-cli-1.0.76-darwin-arm64.tar.gz`,
-    archiveSha256: '6d9776cbde1b7d6a23c7279364578df2d5ea54cdbb041951d97b68567bce8cc8',
-    archiveSize: 12216145,
-    archiveFormat: 'tar.gz',
-    archiveEntry: 'lark-cli',
-    binarySha256: '95bdd996ca4a8071ccac14f1542c9509557eb8f7091dd489e51139ef8aa1be80',
-    binarySize: 43373090,
-    targetName: 'lark-cli',
-    allowedHosts: GITHUB_HOSTS,
-  },
-}
-
-const MAX_ARCHIVE_SIZE = 16 * 1024 * 1024
-const MAX_BINARY_SIZE = 64 * 1024 * 1024
+const MAX_ARCHIVE_SIZE = 24 * 1024 * 1024
+const MAX_BINARY_SIZE = 96 * 1024 * 1024
+const MAX_META_SIZE = 4 * 1024 * 1024
 const DOWNLOAD_TIMEOUT_MS = 120_000
+
+/** Resolved per-platform release-asset shape. */
+interface PlatformInfo {
+  /** Release OS token (`windows` / `linux` / `darwin`). */
+  os: 'windows' | 'linux' | 'darwin'
+  /** Release CPU token (`amd64` / `arm64`). */
+  arch: 'amd64' | 'arm64'
+  /** Archive container format for this OS. */
+  format: 'zip' | 'tar.gz'
+  /** Binary entry name inside the archive, and install filename. */
+  entry: string
+}
+
+/** One resolved GitHub release: its tag and asset name → download URL map. */
+interface Release {
+  /** Normalized tag, e.g. `v1.0.87`. */
+  tag: string
+  /** Asset filename → browser_download_url. */
+  assets: Map<string, string>
+}
 
 function sha256(buf: Buffer | Uint8Array): string {
   return createHash('sha256').update(buf).digest('hex')
 }
 
-function pinForHost(): Pin {
-  const key = `${platform()}-${arch()}`
-  const pin = PINS[key]
-  if (pin === undefined) {
-    throw new Error(`lark-cli: no pinned binary for this platform (${key}); supported: ${Object.keys(PINS).join(', ')}`)
+/** Map the running Node platform/arch to the release's asset naming. */
+function platformInfo(): PlatformInfo {
+  const p = platform()
+  const a = arch()
+  const os = p === 'win32' ? 'windows' : p === 'darwin' ? 'darwin' : p === 'linux' ? 'linux' : undefined
+  const cpu = a === 'x64' ? 'amd64' : a === 'arm64' ? 'arm64' : undefined
+  if (os === undefined || cpu === undefined) {
+    throw new Error(`lark-cli: unsupported platform (${p}-${a})`)
   }
-  return pin
+  const format = os === 'windows' ? 'zip' : 'tar.gz'
+  const entry = os === 'windows' ? 'lark-cli.exe' : 'lark-cli'
+  return { os, arch: cpu, format, entry }
 }
 
-/** Directory holding the managed lark-cli binary (per-user, persistent). */
+/** Directory holding the managed lark-cli binary and its version stamp (per-user). */
 function binDir(): string {
   return join(homedir(), '.dsh', 'runtime', 'lark-cli')
 }
 
-async function fileMatches(path: string, size: number, hash: string): Promise<boolean> {
+function stampFile(): string {
+  return join(binDir(), '.lark-cli-version')
+}
+
+async function fileExists(path: string): Promise<boolean> {
   try {
-    const info = await stat(path)
-    if (!info.isFile() || info.size !== size) return false
-    return sha256(await readFile(path)) === hash
+    return (await stat(path)).isFile()
   } catch {
     return false
   }
 }
 
-/**
- * Return the path to an already-installed, hash-verified lark-cli binary, or
- * `undefined` if it is not present. Never downloads — callers use this to probe
- * status without triggering a 12 MB fetch.
- * @returns the verified binary path, or `undefined`.
- */
-export async function larkcliPath(): Promise<string | undefined> {
-  let pin: Pin
+async function readStamp(): Promise<string | undefined> {
   try {
-    pin = pinForHost()
+    return (await readFile(stampFile(), 'utf8')).trim() || undefined
   } catch {
     return undefined
   }
-  const target = join(binDir(), pin.targetName)
-  return (await fileMatches(target, pin.binarySize, pin.binarySha256)) ? target : undefined
 }
 
-// ---- pinned download ------------------------------------------------------
+async function writeStamp(tag: string): Promise<void> {
+  await writeFile(stampFile(), `${tag}\n`, { mode: 0o600 })
+}
 
-async function download(pin: Pin): Promise<Buffer> {
-  const initial = new URL(pin.url)
-  if (initial.protocol !== 'https:' || !pin.allowedHosts.includes(initial.hostname)) {
-    throw new Error('lark-cli: refusing to download from an untrusted URL')
+/** Compare `a` vs `b` numerically on their first three dotted components. */
+function compareVersions(a: string, b: string): number {
+  const parse = (v: string): number[] =>
+    v.replace(/^v/, '').split(/[.\-+]/).slice(0, 3).map((n) => Number.parseInt(n, 10) || 0)
+  const pa = parse(a)
+  const pb = parse(b)
+  for (let i = 0; i < 3; i++) {
+    const d = (pa[i] ?? 0) - (pb[i] ?? 0)
+    if (d !== 0) return d < 0 ? -1 : 1
   }
-  const response = await fetch(pin.url, {
+  return 0
+}
+
+/** Filename of the archive asset for the current platform at a given tag. */
+function assetName(info: PlatformInfo, tag: string): string {
+  const ver = tag.replace(/^v/, '')
+  return `lark-cli-${ver}-${info.os}-${info.arch}.${info.format}`
+}
+
+// ---- network (host-allowlisted) -------------------------------------------
+
+async function httpBytes(url: string, maxBytes: number): Promise<Buffer> {
+  const initial = new URL(url)
+  if (initial.protocol !== 'https:' || !GITHUB_HOSTS.includes(initial.hostname as (typeof GITHUB_HOSTS)[number])) {
+    throw new Error('lark-cli: refusing to fetch from an untrusted URL')
+  }
+  const response = await fetch(url, {
     redirect: 'follow',
-    headers: { 'user-agent': 'dsh-feishu-larkcli/1' },
+    headers: { 'user-agent': 'dsh-feishu-larkcli/2', accept: 'application/octet-stream, application/vnd.github+json' },
     signal: AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS),
   })
-  if (!response.ok) throw new Error(`lark-cli: download failed (HTTP ${response.status})`)
+  if (!response.ok) throw new Error(`lark-cli: fetch failed (HTTP ${response.status})`)
   try {
     const finalHost = new URL(response.url).hostname
-    if (finalHost !== '' && !pin.allowedHosts.includes(finalHost)) {
-      throw new Error('lark-cli: download redirected to an untrusted host')
+    if (finalHost !== '' && !GITHUB_HOSTS.includes(finalHost as (typeof GITHUB_HOSTS)[number])) {
+      throw new Error('lark-cli: fetch redirected to an untrusted host')
     }
   } catch (error) {
     if (error instanceof Error && error.message.includes('untrusted')) throw error
   }
   const bytes = await response.arrayBuffer()
-  if (bytes.byteLength > MAX_ARCHIVE_SIZE) throw new Error('lark-cli: downloaded archive is too large')
+  if (bytes.byteLength > maxBytes) throw new Error('lark-cli: fetched resource is too large')
   return Buffer.from(bytes)
+}
+
+// ---- latest-release resolution (memoized per process) ---------------------
+
+let latestMemo: Promise<Release> | undefined
+
+async function fetchLatest(): Promise<Release> {
+  const buf = await httpBytes(`${GITHUB_API}/repos/${REPO}/releases/latest`, MAX_META_SIZE)
+  const data = JSON.parse(buf.toString('utf8')) as { tag_name?: unknown; assets?: unknown }
+  const rawTag = typeof data.tag_name === 'string' ? data.tag_name : ''
+  if (!/^v?\d+\.\d+\.\d+/.test(rawTag)) throw new Error('lark-cli: could not resolve latest release tag')
+  if (compareVersions(rawTag, MIN_VERSION) < 0) {
+    throw new Error(`lark-cli: latest release ${rawTag} is below the minimum supported ${MIN_VERSION}`)
+  }
+  const assets = new Map<string, string>()
+  if (Array.isArray(data.assets)) {
+    for (const asset of data.assets) {
+      const name = (asset as { name?: unknown }).name
+      const dl = (asset as { browser_download_url?: unknown }).browser_download_url
+      if (typeof name === 'string' && typeof dl === 'string') assets.set(name, dl)
+    }
+  }
+  const tag = rawTag.startsWith('v') ? rawTag : `v${rawTag}`
+  return { tag, assets }
+}
+
+/** Resolve the latest release once per process; failures clear the memo. */
+function resolveLatest(): Promise<Release> {
+  if (latestMemo === undefined) {
+    latestMemo = fetchLatest().catch((error: unknown) => {
+      latestMemo = undefined
+      throw error
+    })
+  }
+  return latestMemo
+}
+
+/** Parse `sha256␠␠[*]name` lines from a checksums manifest. */
+function checksumFor(manifest: string, name: string): string {
+  for (const line of manifest.split(/\r?\n/)) {
+    const match = line.match(/^([0-9a-fA-F]{64})\s+\*?(.+)$/)
+    if (match !== null && match[2]!.trim() === name) return match[1]!.toLowerCase()
+  }
+  throw new Error(`lark-cli: ${name} not listed in checksums.txt`)
 }
 
 // ---- minimal archive readers ----------------------------------------------
@@ -243,39 +273,61 @@ function extractTarGzEntry(archive: Buffer, entryName: string): Buffer {
 
 let ensureInFlight: Promise<string> | undefined
 
-async function install(pin: Pin, target: string): Promise<string> {
-  const archive = await download(pin)
-  if (archive.length !== pin.archiveSize) throw new Error('lark-cli: downloaded archive size mismatch')
-  if (sha256(archive) !== pin.archiveSha256) throw new Error('lark-cli: downloaded archive checksum mismatch')
+async function install(info: PlatformInfo, release: Release, target: string): Promise<string> {
+  const name = assetName(info, release.tag)
+  const assetUrl = release.assets.get(name)
+  if (assetUrl === undefined) throw new Error(`lark-cli: release ${release.tag} has no asset ${name}`)
+  const sumsUrl = release.assets.get('checksums.txt')
+  if (sumsUrl === undefined) throw new Error(`lark-cli: release ${release.tag} has no checksums.txt`)
 
-  const binary = pin.archiveFormat === 'zip'
-    ? extractZipEntry(archive, pin.archiveEntry)
-    : extractTarGzEntry(archive, pin.archiveEntry)
-  if (binary.length !== pin.binarySize) throw new Error('lark-cli: extracted binary size mismatch')
-  if (sha256(binary) !== pin.binarySha256) throw new Error('lark-cli: extracted binary checksum mismatch')
+  const manifest = (await httpBytes(sumsUrl, MAX_META_SIZE)).toString('utf8')
+  const expected = checksumFor(manifest, name)
 
-  const staging = join(binDir(), `.lark-cli-${pin.binarySize}.part`)
+  const archive = await httpBytes(assetUrl, MAX_ARCHIVE_SIZE)
+  if (sha256(archive) !== expected) throw new Error('lark-cli: downloaded archive checksum mismatch')
+
+  const binary = info.format === 'zip'
+    ? extractZipEntry(archive, info.entry)
+    : extractTarGzEntry(archive, info.entry)
+  if (binary.length > MAX_BINARY_SIZE) throw new Error('lark-cli: extracted binary is too large')
+
+  const staging = join(binDir(), `.lark-cli-${process.pid}.part`)
   await writeFile(staging, binary, { mode: 0o700 })
   await rename(staging, target) // atomic within the same directory
   await chmod(target, 0o700).catch(() => {})
+  await writeStamp(release.tag)
   return target
 }
 
 async function doEnsure(): Promise<string> {
-  const pin = pinForHost()
+  const info = platformInfo()
   await mkdir(binDir(), { recursive: true })
-  const target = join(binDir(), pin.targetName)
-  if (await fileMatches(target, pin.binarySize, pin.binarySha256)) {
+  const target = join(binDir(), info.entry)
+
+  let release: Release
+  try {
+    release = await resolveLatest()
+  } catch (error) {
+    // Offline / rate-limited: reuse an already-installed binary rather than fail.
+    if (await fileExists(target)) {
+      await chmod(target, 0o700).catch(() => {})
+      return target
+    }
+    throw error
+  }
+
+  if ((await readStamp()) === release.tag && (await fileExists(target))) {
     await chmod(target, 0o700).catch(() => {})
     return target
   }
-  return install(pin, target)
+  return install(info, release, target)
 }
 
 /**
- * Ensure a hash-verified lark-cli binary is installed, downloading and
- * extracting the pinned release on first use, and return its path. Concurrent
- * calls share one install; a failure clears the cache so the next call retries.
+ * Ensure an up-to-date, checksum-verified lark-cli binary is installed,
+ * downloading the latest release on first use or when a newer one is available,
+ * and return its path. Concurrent calls share one install; a failure clears the
+ * cache so the next call retries.
  * @returns the path to the verified lark-cli binary.
  */
 export function ensureLarkcli(): Promise<string> {
@@ -286,6 +338,33 @@ export function ensureLarkcli(): Promise<string> {
     })
   }
   return ensureInFlight
+}
+
+/**
+ * Return the path to an already-installed lark-cli binary without any network
+ * access, or `undefined` if none is present. Integrity was verified against the
+ * release checksum manifest at install time; callers use this to probe status
+ * without triggering a download.
+ * @returns the installed binary path, or `undefined`.
+ */
+export async function larkcliPath(): Promise<string | undefined> {
+  let info: PlatformInfo
+  try {
+    info = platformInfo()
+  } catch {
+    return undefined
+  }
+  const target = join(binDir(), info.entry)
+  return (await fileExists(target)) ? target : undefined
+}
+
+/**
+ * The release tag of the currently installed binary (from the version stamp),
+ * or `undefined` if unknown. Used to align materialized skills with the binary.
+ * @returns the installed release tag (e.g. `v1.0.87`), or `undefined`.
+ */
+export function installedLarkVersion(): Promise<string | undefined> {
+  return readStamp()
 }
 
 /**
