@@ -4,11 +4,14 @@
  * `feishu_connect` starts the TokensAgent-style one-click app creation (the
  * user opens ONE link and confirms; the Feishu app is created with the full
  * scope grant pre-filled), then the plugin provisions the official Larksuite
- * CLI (pinned, SHA-256-verified) and drives its built-in device-code login —
- * the user opens a SECOND link, authorizes, and lark-cli stores the personal
- * user token in the OS keychain. The flow is idempotent — an existing session
- * is reused with no link, and a returning user who only needs to re-authorize
- * opens just that one link. No redirect URL, no whitelist, no admin approval.
+ * CLI (latest release, checksum-verified, auto-updating) and drives its
+ * built-in device-code login — the user opens a SECOND link, authorizes, and
+ * lark-cli stores the personal user token in the OS keychain. The flow is
+ * idempotent — an existing session is reused with no link, and a returning user
+ * who only needs to re-authorize opens just that one link. No redirect URL, no
+ * whitelist, no admin approval. On connect the plugin also materializes the
+ * official lark-* skills (version-matched to the binary) so custom sibling
+ * skills that depend on `lark-shared` just work — install-and-go, self-healing.
  * Domain tools (`feishu_create_doc`, `feishu_send_message`,
  * `feishu_create_bitable`) then act as that personal identity through the
  * generic `lark-cli api` passthrough. `/feishu-connect` and `/feishu-status`
@@ -25,6 +28,7 @@ import { beginRegistration, pollRegistration } from './register.ts'
 import { TENANT_SCOPES, USER_SCOPES } from './scopes.ts'
 import { createLarkcli, type AuthStatus } from './larkcli.ts'
 import { readIdentity, writeIdentity, type IdentityRecord } from './identity.ts'
+import { ensureSkills } from './skills-provision.ts'
 
 export const name = 'feishu'
 export const inject = ['tools', 'credentials']
@@ -80,12 +84,33 @@ export function apply(ctx: Context, config: Config) {
   let flowAbort: AbortController | undefined
   const phaseWaiters = new Set<() => void>()
 
+  // Materialize the official lark-* skills once the binary is present (i.e. on
+  // a successful connect). Best-effort and deduped: it must never fail a
+  // connection, and its own version stamp makes repeat calls cheap. Because a
+  // missing `lark-shared/SKILL.md` forces re-materialization, this also self-
+  // heals whenever a user deletes the managed skills.
+  let skillsInFlight: Promise<unknown> | undefined
+  function materializeSkillsInBackground(): void {
+    if (skillsInFlight !== undefined) return
+    skillsInFlight = ensureSkills()
+      .then((result) => {
+        if (!result.skipped) {
+          ctx.logger.info('materialized %d lark skills (%s) into %s', result.count, result.version, result.root)
+        }
+      })
+      .catch((error: unknown) => {
+        ctx.logger.warn('lark skill materialization failed: %s', error instanceof Error ? error.message : String(error))
+      })
+      .finally(() => { skillsInFlight = undefined })
+  }
+
   function setState(next: Partial<ConnectState> & { phase: ConnectPhase }): void {
     state.phase = next.phase
     state.qrUrl = next.qrUrl
     state.authorizeUrl = next.authorizeUrl
     state.message = next.message
     if (next.openId !== undefined) state.openId = next.openId
+    if (next.phase === 'connected') materializeSkillsInBackground()
     for (const wake of phaseWaiters) wake()
     phaseWaiters.clear()
   }
@@ -574,6 +599,23 @@ export function apply(ctx: Context, config: Config) {
         const text = renderStatus(await fullStatus())
           .map((block) => block.text).join('\n')
         return { kind: 'success', text }
+      },
+    })
+
+    commandCtx.commands.register({
+      name: 'feishu-skills-refresh',
+      description: 'Re-download the lark-cli binary if newer, then re-materialize the official lark-* skills '
+        + '(version-matched). Normally automatic on connect; use this to force an update.',
+      async handler() {
+        try {
+          const result = await ensureSkills(true)
+          return {
+            kind: 'success',
+            text: `Materialized ${result.count} lark skills (${result.version}) into ${result.root}.`,
+          }
+        } catch (error) {
+          return { kind: 'error', text: error instanceof Error ? error.message : String(error) }
+        }
       },
     })
   })
