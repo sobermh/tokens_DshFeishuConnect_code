@@ -21,12 +21,19 @@ import { mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { dirname, join, resolve, sep } from 'node:path'
 import { promisify } from 'node:util'
+import { createConcurrencyLimiter } from './concurrency.ts'
 import { ensureLarkcli, installedLarkVersion, probeLarkcli } from './larkcli-provision.ts'
 
 const execFileP = promisify(execFile)
 
 /** The skill every custom lark-* skill loads as its base; our self-heal sentinel. */
 const SENTINEL = 'lark-shared'
+
+/** Keep native CLI fan-out bounded while allowing independent reads to overlap. */
+const MAX_CLI_CONCURRENCY = 8
+
+/** Names owned by this provisioner are one safe path segment in its namespace. */
+const MANAGED_SKILL_NAME = /^lark-[a-z0-9]+(?:-[a-z0-9]+)*$/
 
 /** Env that silences lark-cli's update/skills notices so output stays clean. */
 const QUIET_ENV = { LARKSUITE_CLI_NO_UPDATE_NOTIFIER: '1', LARKSUITE_CLI_NO_SKILLS_NOTIFIER: '1' } as const
@@ -70,7 +77,14 @@ async function fileExists(path: string): Promise<boolean> {
 
 async function readStamp(root: string): Promise<SkillStamp | undefined> {
   try {
-    return JSON.parse(await readFile(stampFile(root), 'utf8')) as SkillStamp
+    const value = JSON.parse(await readFile(stampFile(root), 'utf8')) as Partial<SkillStamp>
+    if (typeof value.larkVersion !== 'string'
+      || typeof value.materializedAt !== 'string'
+      || !Array.isArray(value.skills)
+      || !value.skills.every((name) => typeof name === 'string' && MANAGED_SKILL_NAME.test(name))) {
+      return undefined
+    }
+    return value as SkillStamp
   } catch {
     return undefined
   }
@@ -82,15 +96,19 @@ async function writeStamp(root: string, stamp: SkillStamp): Promise<void> {
 
 // ---- lark-cli invocation --------------------------------------------------
 
+const withCliSlot = createConcurrencyLimiter(MAX_CLI_CONCURRENCY)
+
 async function larkcli(bin: string, args: readonly string[]): Promise<string> {
-  const { stdout } = await execFileP(bin, [...args], {
-    encoding: 'utf8',
-    timeout: 30_000,
-    maxBuffer: 32 * 1024 * 1024,
-    windowsHide: true,
-    env: { ...process.env, ...QUIET_ENV },
+  return withCliSlot(async () => {
+    const { stdout } = await execFileP(bin, [...args], {
+      encoding: 'utf8',
+      timeout: 30_000,
+      maxBuffer: 32 * 1024 * 1024,
+      windowsHide: true,
+      env: { ...process.env, ...QUIET_ENV },
+    })
+    return stdout
   })
-  return stdout
 }
 
 /** Parse a lark-cli JSON envelope leniently (notices may precede the body). */
@@ -111,29 +129,49 @@ function parseEnvelope(output: string): Record<string, unknown> {
 async function listNames(bin: string): Promise<string[]> {
   const map = parseEnvelope(await larkcli(bin, ['skills', 'list', '--json']))
   const skills = Array.isArray(map['skills']) ? map['skills'] : []
-  return skills
+  const names = skills
     .map((s) => (typeof (s as { name?: unknown }).name === 'string' ? (s as { name: string }).name : ''))
     .filter((n) => n !== '')
+  for (const name of names) assertManagedSkillName(name)
+  if (new Set(names).size !== names.length) throw new Error('lark-cli skills: duplicate skill name')
+  return names
 }
 
 /** Recursively enumerate all file entry paths under a skill (or subpath). */
 async function listFiles(bin: string, path: string): Promise<string[]> {
   const map = parseEnvelope(await larkcli(bin, ['skills', 'list', path, '--json']))
   const entries = Array.isArray(map['entries']) ? map['entries'] : []
-  const files: string[] = []
-  for (const raw of entries) {
+  const files = await Promise.all(entries.map(async (raw): Promise<string[]> => {
     const entry = raw as { path?: unknown; is_dir?: unknown }
-    if (typeof entry.path !== 'string' || entry.path === '') continue
-    if (entry.is_dir === true) files.push(...(await listFiles(bin, entry.path)))
-    else files.push(entry.path)
+    if (typeof entry.path !== 'string' || entry.path === '') return []
+    if (entry.is_dir === true) return listFiles(bin, entry.path)
+    return [entry.path]
+  }))
+  return files.flat()
+}
+
+/** Reject untrusted stamp/CLI names before they become filesystem paths. */
+export function assertManagedSkillName(name: string): void {
+  if (!MANAGED_SKILL_NAME.test(name)) {
+    throw new Error(`lark-cli skills: invalid managed skill name: ${name}`)
   }
-  return files
+}
+
+/** Resolve one owned skill directory and prove it remains below `root`. */
+export function managedSkillDir(root: string, name: string): string {
+  assertManagedSkillName(name)
+  const safeRoot = resolve(root)
+  const destination = resolve(safeRoot, name)
+  if (!destination.startsWith(safeRoot + sep)) {
+    throw new Error(`lark-cli skills: skill path escapes root: ${name}`)
+  }
+  return destination
 }
 
 /** Materialize every file of one skill under `<root>/<name>/…`. */
 async function materializeSkill(bin: string, root: string, name: string): Promise<void> {
-  const base = resolve(root, name)
-  for (const entryPath of await listFiles(bin, name)) {
+  const base = managedSkillDir(root, name)
+  await Promise.all((await listFiles(bin, name)).map(async (entryPath) => {
     // `skills read` accepts the full slash-form path; entries include the skill
     // name as a prefix, which we strip to get the on-disk relative path.
     const rel = entryPath.startsWith(`${name}/`) ? entryPath.slice(name.length + 1) : entryPath
@@ -144,14 +182,18 @@ async function materializeSkill(bin: string, root: string, name: string): Promis
     const content = await larkcli(bin, ['skills', 'read', entryPath])
     await mkdir(dirname(dest), { recursive: true })
     await writeFile(dest, content, 'utf8')
-  }
+  }))
 }
 
 /** Remove skill dirs we previously owned that upstream no longer ships. */
-async function pruneRemoved(root: string, oldNames: readonly string[], newNames: readonly string[]): Promise<void> {
+export async function pruneRemoved(
+  root: string,
+  oldNames: readonly string[],
+  newNames: readonly string[],
+): Promise<void> {
   const keep = new Set(newNames)
   for (const name of oldNames) {
-    if (!keep.has(name)) await rm(join(root, name), { recursive: true, force: true })
+    if (!keep.has(name)) await rm(managedSkillDir(root, name), { recursive: true, force: true })
   }
 }
 
@@ -177,10 +219,10 @@ export async function ensureSkills(force = false): Promise<SkillResult> {
 
   const names = await listNames(bin)
   // Materialize the sentinel first so a mid-way failure still fixes the loop.
-  const ordered = [...names].sort((a, b) => (a === SENTINEL ? -1 : b === SENTINEL ? 1 : 0))
-  for (const name of ordered) {
-    await materializeSkill(bin, root, name)
-  }
+  if (names.includes(SENTINEL)) await materializeSkill(bin, root, SENTINEL)
+  await Promise.all(names.filter((name) => name !== SENTINEL).map(
+    async (name) => materializeSkill(bin, root, name),
+  ))
 
   if (stamp !== undefined) await pruneRemoved(root, stamp.skills, names)
   await writeStamp(root, { larkVersion: version, skills: names, materializedAt: new Date().toISOString() })

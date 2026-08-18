@@ -157,12 +157,12 @@ export function apply(ctx: Context, config: Config) {
    * orphaning it. Returns `false` when the stored credentials are incomplete,
    * so the caller falls back to a full registration.
    */
-  async function rebindStoredApp(signal: AbortSignal): Promise<boolean> {
+  async function rebindStoredApp(domain: 'feishu' | 'lark', signal: AbortSignal): Promise<boolean> {
     const id = await ctx.credentials.resolve(appIdRef)
     const secret = await ctx.credentials.resolve(appSecretRef)
     if (id === undefined || secret === undefined) return false
     await lark.provision()
-    await lark.configInit(id.value, secret.value, signal)
+    await lark.configInit(id.value, secret.value, domain, signal)
     return true
   }
 
@@ -176,14 +176,14 @@ export function apply(ctx: Context, config: Config) {
    * cannot be reused at all (no stored credentials to re-bind), so the caller
    * falls back to a full registration. A genuine authorization failure throws.
    */
-  async function authorizeReusingApp(signal: AbortSignal): Promise<boolean> {
+  async function authorizeReusingApp(domain: 'feishu' | 'lark', signal: AbortSignal): Promise<boolean> {
     await lark.provision()
     let begin
     try {
       begin = await lark.loginBegin(signal)
     } catch {
       // Profile config missing/corrupt: re-bind from stored creds, then retry.
-      if (!(await rebindStoredApp(signal))) return false
+      if (!(await rebindStoredApp(domain, signal))) return false
       try {
         begin = await lark.loginBegin(signal)
       } catch {
@@ -218,7 +218,7 @@ export function apply(ctx: Context, config: Config) {
     })
 
     // Poll until the created app's credentials arrive.
-    let appId: string, appSecret: string
+    let appId: string, appSecret: string, appDomain: 'feishu' | 'lark'
     for (;;) {
       await sleep(session.intervalSec * 1000, signal)
       const outcome = await pollRegistration(session, signal)
@@ -229,6 +229,7 @@ export function apply(ctx: Context, config: Config) {
       }
       appId = outcome.appId
       appSecret = outcome.appSecret
+      appDomain = outcome.domain
       setState({
         phase: 'creating',
         qrUrl: session.qrUrl,
@@ -244,7 +245,7 @@ export function apply(ctx: Context, config: Config) {
     // Provision the pinned lark-cli binary (first run downloads ~12 MB) and
     // bind the created app's credentials to the profile.
     await lark.provision()
-    await lark.configInit(appId, appSecret, signal)
+    await lark.configInit(appId, appSecret, appDomain, signal)
 
     // Drive lark-cli's built-in device-code login: it returns the second link
     // for the user to open, then blocks until they authorize in the browser.
@@ -279,7 +280,7 @@ export function apply(ctx: Context, config: Config) {
 
     // Reuse an already-created app when possible; only register when we must.
     const appConfigured = (await ctx.credentials.describe(appIdRef)).configured
-    if (appConfigured && await authorizeReusingApp(signal)) return
+    if (appConfigured && await authorizeReusingApp(domain, signal)) return
 
     await registerAndAuthorize(domain, signal)
   }

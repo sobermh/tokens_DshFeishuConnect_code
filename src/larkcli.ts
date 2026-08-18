@@ -153,6 +153,21 @@ export interface LarkcliOptions {
   baseURL: string
 }
 
+/** Brand understood by lark-cli's profile configuration. */
+export type LarkBrand = 'feishu' | 'lark'
+
+/**
+ * Build the non-secret argv for profile initialization. Kept separate so the
+ * Feishu/Lark routing decision is directly testable; the app secret is still
+ * supplied only over stdin by {@link createLarkcli}.
+ */
+export function configInitArgs(appId: string, profile: string, brand: LarkBrand): string[] {
+  return [
+    'config', 'init', '--app-id', appId, '--app-secret-stdin',
+    '--brand', brand, '--name', profile, '--force-init',
+  ]
+}
+
 /**
  * Build the lark-cli orchestrator bound to one profile.
  * @param options - profile name and OpenAPI origin.
@@ -193,9 +208,14 @@ export function createLarkcli(options: LarkcliOptions) {
      * app — the one one-click registration just minted — so we take the CLI's
      * documented escape hatch and pin every later call to our named profile.
      */
-    async configInit(appId: string, appSecret: string, signal?: AbortSignal): Promise<void> {
+    async configInit(
+      appId: string,
+      appSecret: string,
+      brand: LarkBrand,
+      signal?: AbortSignal,
+    ): Promise<void> {
       const result = await run(
-        ['config', 'init', '--app-id', appId, '--app-secret-stdin', '--brand', 'feishu', '--name', profile, '--force-init'],
+        configInitArgs(appId, profile, brand),
         { stdin: appSecret, signal },
       )
       ensureOk(result, 'config init')

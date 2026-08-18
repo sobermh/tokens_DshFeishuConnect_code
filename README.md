@@ -61,7 +61,8 @@ pnpm dsh --profile <名字> --dump-config
 - `src/register.ts` — 一键创建应用协议（RFC 8628 设备授权；begin/poll、域名自动切换、addons 权限预填）
 - `src/scopes.ts` — 预授权 scope 清单（tenant + user；不含需管理员审批的 self_manage/patch）
 - `src/larkcli-provision.ts` — 跟随最新 release 下载 lark-cli + 用 release 自带 `checksums.txt` 校验 + 版本戳（缺则下、有新版则更）+ 自带 zip/tar.gz 解包 + 离线回退缓存
-- `src/skills-provision.ts` — 从二进制物化官方 lark-* skill 到 `~/.dsh/skills/`（版本对齐、幂等自愈、只管自身命名空间）
+- `src/concurrency.ts` — 公平 FIFO 并发门：槽位直接交给最早等待者，避免新任务插队突破上限
+- `src/skills-provision.ts` — 从二进制物化官方 lark-* skill 到 `~/.dsh/skills/`（版本对齐、幂等自愈、严格限制 `lark-*` 命名空间、最多 8 个 CLI 并发）
 - `src/larkcli.ts` — lark-cli 运行器：设备码登录、状态查询、`lark-cli api` 通用透传
 - `src/identity.ts` — 连接身份元数据缓存（非密钥；重启识别、跨工具复用 profile）
 - `src/index.ts` — 插件入口：工具与命令注册、连接状态机（幂等复用 + `force` 换账号）、连接后台物化 skill、凭据管理
@@ -70,6 +71,9 @@ pnpm dsh --profile <名字> --dump-config
 
 ```sh
 node_modules/.bin/tsc -b tsconfig.json   # 类型检查
+node_modules/.bin/tsx --test tests/*.test.ts # 32 条正向 + 33 条反向业务/安全回归
 ```
 
 注意：`exports` 指向 `src/index.ts`（TS 源码），依赖 `pnpm dsh` 的 tsx 源码启动。首次连接会联网:向 GitHub 解析 lark-cli 最新 release、下载对应平台二进制、用该 release 自带 `checksums.txt` 校验 sha256、再从同一二进制物化官方 lark-* skill。设 `MIN_VERSION` 下限防降级;离线且已有缓存二进制时复用不报错。
+
+本仓库当前标记为 `UNLICENSED`，仅用于本地开发；在作者明确选择并补充许可证前不要重新分发。

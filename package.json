@@ -1,8 +1,14 @@
 {
   "name": "@tokens/feishu",
+  "version": "0.1.0",
   "description": "Feishu (Lark) connector bundle: one-click app creation + personal OAuth, doc/message tools. Local dev, not published.",
   "private": true,
+  "license": "UNLICENSED",
   "type": "module",
+  "scripts": {
+    "typecheck": "tsc -b tsconfig.json",
+    "test": "tsx --test tests/*.test.ts"
+  },
   "exports": {
     ".": "./src/index.ts",
     "./cordis.patch.yml": "./cordis.patch.yml"
