@@ -40,3 +40,26 @@ export function createConcurrencyLimiter(maxConcurrent: number) {
     }
   }
 }
+
+/** Retry an idempotent asynchronous operation after transient failures. */
+export async function retryAsync<T>(
+  task: () => Promise<T>,
+  maxAttempts: number,
+  delayMs: number,
+): Promise<T> {
+  if (!Number.isInteger(maxAttempts) || maxAttempts < 1) {
+    throw new RangeError('maxAttempts must be a positive integer')
+  }
+  let lastError: unknown
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      return await task()
+    } catch (error) {
+      lastError = error
+      if (attempt < maxAttempts && delayMs > 0) {
+        await new Promise((resolve) => setTimeout(resolve, delayMs * attempt))
+      }
+    }
+  }
+  throw lastError
+}

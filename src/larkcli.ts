@@ -10,6 +10,7 @@
  */
 
 import { spawn } from 'node:child_process'
+import { assertLarkProfileName } from './identity.ts'
 import { ensureLarkcli, larkcliPath } from './larkcli-provision.ts'
 
 /** lark-cli scope groups requested at device login. */
@@ -175,6 +176,7 @@ export function configInitArgs(appId: string, profile: string, brand: LarkBrand)
  */
 export function createLarkcli(options: LarkcliOptions) {
   const { profile, baseURL } = options
+  assertLarkProfileName(profile)
 
   async function run(args: readonly string[], runOptions: RunOptions = {}): Promise<RunResult> {
     const bin = await ensureLarkcli()

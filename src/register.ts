@@ -91,6 +91,20 @@ function encodeAddons(tenantScopes: readonly string[], userScopes: readonly stri
   return gzipSync(Buffer.from(JSON.stringify(payload))).toString('base64url')
 }
 
+/** Accept only the HTTPS confirmation page owned by the selected platform. */
+function verificationUrl(raw: string, expectedHost: string): URL {
+  let url: URL
+  try {
+    url = new URL(raw)
+  } catch {
+    throw new Error('Feishu registration begin: invalid confirm URL')
+  }
+  if (url.protocol !== 'https:' || url.hostname !== expectedHost) {
+    throw new Error('Feishu registration begin: untrusted confirm URL')
+  }
+  return url
+}
+
 /**
  * Start one one-click registration.
  * @param options - domain, preset identity, and scope grant.
@@ -111,7 +125,9 @@ export async function beginRegistration(options: RegisterOptions): Promise<Regis
     throw new Error('Feishu registration begin: response missing device_code or confirm URL')
   }
 
-  const url = new URL(res.verification_uri_complete)
+  // The URL is displayed directly to the user, so treat the response as
+  // untrusted input even though it came from the accounts API.
+  const url = verificationUrl(res.verification_uri_complete, host)
   url.searchParams.set('from', 'sdk')
   url.searchParams.set('tp', 'sdk')
   url.searchParams.set('source', 'dsh-feishu')

@@ -21,7 +21,7 @@ import { mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { dirname, join, resolve, sep } from 'node:path'
 import { promisify } from 'node:util'
-import { createConcurrencyLimiter } from './concurrency.ts'
+import { createConcurrencyLimiter, retryAsync } from './concurrency.ts'
 import { ensureLarkcli, installedLarkVersion, probeLarkcli } from './larkcli-provision.ts'
 
 const execFileP = promisify(execFile)
@@ -99,7 +99,10 @@ async function writeStamp(root: string, stamp: SkillStamp): Promise<void> {
 const withCliSlot = createConcurrencyLimiter(MAX_CLI_CONCURRENCY)
 
 async function larkcli(bin: string, args: readonly string[]): Promise<string> {
-  return withCliSlot(async () => {
+  // lark-cli occasionally exits 1 with no stderr while many independent
+  // embedded-skill reads are in flight. These commands are read-only and
+  // idempotent, so release the slot and retry a bounded number of times.
+  return retryAsync(() => withCliSlot(async () => {
     const { stdout } = await execFileP(bin, [...args], {
       encoding: 'utf8',
       timeout: 30_000,
@@ -108,7 +111,7 @@ async function larkcli(bin: string, args: readonly string[]): Promise<string> {
       env: { ...process.env, ...QUIET_ENV },
     })
     return stdout
-  })
+  }), 3, 100)
 }
 
 /** Parse a lark-cli JSON envelope leniently (notices may precede the body). */

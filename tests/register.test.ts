@@ -238,4 +238,87 @@ test('registration business scenarios', { concurrency: false }, async (t) => {
       assert.deepEqual(await pollRegistration(session()), { status: 'pending' })
     })
   })
+
+  await t.test('POS-44 begin request uses the PersonalAgent registration contract', async () => {
+    await withFetch(async (_input, init) => {
+      const form = new URLSearchParams(String(init?.body))
+      assert.equal(form.get('action'), 'begin')
+      assert.equal(form.get('archetype'), 'PersonalAgent')
+      assert.equal(form.get('auth_method'), 'client_secret')
+      assert.equal(form.get('request_user_info'), 'open_id')
+      return jsonResponse({ device_code: 'device', verification_uri_complete: 'https://accounts.feishu.cn/confirm' })
+    }, async () => { await beginRegistration(options()) })
+  })
+
+  await t.test('POS-45 existing confirmation query parameters are preserved', async () => {
+    await withFetch(async () => jsonResponse({
+      device_code: 'device', verification_uri_complete: 'https://accounts.feishu.cn/confirm?tenant=demo',
+    }), async () => {
+      const result = await beginRegistration(options())
+      assert.equal(new URL(result.qrUrl).searchParams.get('tenant'), 'demo')
+    })
+  })
+
+  await t.test('POS-46 mixed-case Lark tenant brand is detected', async () => {
+    const active = session()
+    await withFetch(async () => jsonResponse({ user_info: { tenant_brand: 'LaRk' } }), async () => {
+      await pollRegistration(active)
+      assert.equal(active.host, 'accounts.larksuite.com')
+    })
+  })
+
+  await t.test('POS-47 an already international session remains on its current host', async () => {
+    const active = session({ host: 'accounts.larksuite.com', switched: true })
+    await withFetch(async () => jsonResponse({ user_info: { tenant_brand: 'lark' } }), async () => {
+      assert.deepEqual(await pollRegistration(active), { status: 'pending' })
+      assert.equal(active.host, 'accounts.larksuite.com')
+      assert.equal(active.switched, true)
+    })
+  })
+
+  await t.test('POS-48 an empty error field is treated as still pending', async () => {
+    await withFetch(async () => jsonResponse({ error: '' }), async () => {
+      assert.deepEqual(await pollRegistration(session()), { status: 'pending' })
+    })
+  })
+
+  await t.test('POS-49 a Feishu tenant brand does not trigger an international switch', async () => {
+    const active = session()
+    await withFetch(async () => jsonResponse({ user_info: { tenant_brand: 'feishu' } }), async () => {
+      await pollRegistration(active)
+      assert.equal(active.host, 'accounts.feishu.cn')
+      assert.equal(active.switched, false)
+    })
+  })
+
+  await t.test('POS-50 caller AbortSignal is combined with the request timeout', async () => {
+    const controller = new AbortController()
+    await withFetch(async (_input, init) => {
+      assert.ok(init?.signal)
+      assert.equal(init.signal.aborted, false)
+      return jsonResponse({ device_code: 'device', verification_uri_complete: 'https://accounts.feishu.cn/confirm' })
+    }, async () => { await beginRegistration({ ...options(), signal: controller.signal }) })
+  })
+
+  await t.test('NEG-48 HTTP confirmation links are rejected', async () => {
+    await withFetch(async () => jsonResponse({
+      device_code: 'device', verification_uri_complete: 'http://accounts.feishu.cn/confirm',
+    }), async () => {
+      await assert.rejects(beginRegistration(options()), /untrusted confirm URL/)
+    })
+  })
+
+  await t.test('NEG-49 confirmation links on an unexpected host are rejected', async () => {
+    await withFetch(async () => jsonResponse({
+      device_code: 'device', verification_uri_complete: 'https://example.com/phishing',
+    }), async () => {
+      await assert.rejects(beginRegistration(options()), /untrusted confirm URL/)
+    })
+  })
+
+  await t.test('NEG-50 begin-registration network failures propagate to the caller', async () => {
+    await withFetch(async () => { throw new Error('DNS unavailable') }, async () => {
+      await assert.rejects(beginRegistration(options()), /DNS unavailable/)
+    })
+  })
 })
