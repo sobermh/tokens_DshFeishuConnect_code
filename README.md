@@ -76,4 +76,6 @@ node_modules/.bin/tsx --test tests/*.test.ts # 53 条正向 + 53 条反向业务
 
 注意：`exports` 指向 `src/index.ts`（TS 源码），依赖 `pnpm dsh` 的 tsx 源码启动。首次连接会联网:向 GitHub 解析 lark-cli 最新 release、下载对应平台二进制、用该 release 自带 `checksums.txt` 校验 sha256、再从同一二进制物化官方 lark-* skill。设 `MIN_VERSION` 下限防降级;离线且已有缓存二进制时复用不报错。
 
-本仓库当前标记为 `UNLICENSED`，仅用于本地开发；在作者明确选择并补充许可证前不要重新分发。
+## 许可证
+
+本项目采用 [MIT License](LICENSE)。

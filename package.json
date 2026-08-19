@@ -1,9 +1,9 @@
 {
   "name": "@tokens/feishu",
   "version": "0.1.1",
-  "description": "Feishu (Lark) connector bundle: one-click app creation + personal OAuth, doc/message tools. Local dev, not published.",
+  "description": "Feishu (Lark) connector bundle: one-click app creation, personal OAuth, and document/message tools.",
   "private": true,
-  "license": "UNLICENSED",
+  "license": "MIT",
   "type": "module",
   "scripts": {
     "typecheck": "tsc -b tsconfig.json",
