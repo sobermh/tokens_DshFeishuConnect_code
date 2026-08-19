@@ -1,6 +1,6 @@
 {
   "name": "@tokens/feishu",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Feishu (Lark) connector bundle: one-click app creation, personal OAuth, and document/message tools.",
   "private": true,
   "license": "MIT",
@@ -17,5 +17,13 @@
     "bundle": {
       "patch": "./cordis.patch.yml"
     }
+  },
+  "dependencies": {
+    "@deepseek-ai/dsh-credentials": "0.1.0-rc.6",
+    "@deepseek-ai/dsh-tools": "0.1.0-rc.6",
+    "@deepseek-ai/schemastery": "^3.18.1"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1"
   }
 }
