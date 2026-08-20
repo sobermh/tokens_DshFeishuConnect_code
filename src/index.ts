@@ -16,7 +16,7 @@
  * `feishu_create_bitable`) then act as that personal identity through the
  * generic `lark-cli api` passthrough. `/feishu-connect` and `/feishu-status`
  * expose the same flow to humans.
- * @module @tokens/feishu
+ * @module @tokens/dsh-feishu-connect
  */
 
 import type { Context } from '@deepseek-ai/cordis'

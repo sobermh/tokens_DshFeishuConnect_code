@@ -1,6 +1,6 @@
 - insert:
     - id: feishu
-      name: '@tokens/feishu'
+      name: '@tokens/dsh-feishu-connect'
       config:
         appIdEnv: FEISHU_APP_ID
         appSecretEnv: FEISHU_APP_SECRET

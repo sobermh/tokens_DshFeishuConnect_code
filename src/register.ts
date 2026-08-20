@@ -13,6 +13,8 @@ import { gzipSync } from 'node:zlib'
 
 const FEISHU_ACCOUNTS_HOST = 'accounts.feishu.cn'
 const LARK_ACCOUNTS_HOST = 'accounts.larksuite.com'
+const FEISHU_CONFIRM_HOST = 'open.feishu.cn'
+const LARK_CONFIRM_HOST = 'open.larksuite.com'
 const REGISTRATION_PATH = '/oauth/v1/app/registration'
 const HTTP_TIMEOUT_MS = 15_000
 const DEFAULT_INTERVAL_SEC = 5
@@ -91,15 +93,15 @@ function encodeAddons(tenantScopes: readonly string[], userScopes: readonly stri
   return gzipSync(Buffer.from(JSON.stringify(payload))).toString('base64url')
 }
 
-/** Accept only the HTTPS confirmation page owned by the selected platform. */
-function verificationUrl(raw: string, expectedHost: string): URL {
+/** Accept only HTTPS confirmation pages owned by the selected platform. */
+function verificationUrl(raw: string, expectedHosts: readonly string[]): URL {
   let url: URL
   try {
     url = new URL(raw)
   } catch {
     throw new Error('Feishu registration begin: invalid confirm URL')
   }
-  if (url.protocol !== 'https:' || url.hostname !== expectedHost) {
+  if (url.protocol !== 'https:' || !expectedHosts.includes(url.hostname)) {
     throw new Error('Feishu registration begin: untrusted confirm URL')
   }
   return url
@@ -112,6 +114,9 @@ function verificationUrl(raw: string, expectedHost: string): URL {
  */
 export async function beginRegistration(options: RegisterOptions): Promise<RegisterSession> {
   const host = options.domain === 'lark' ? LARK_ACCOUNTS_HOST : FEISHU_ACCOUNTS_HOST
+  const confirmHosts = options.domain === 'lark'
+    ? [LARK_ACCOUNTS_HOST, LARK_CONFIRM_HOST]
+    : [FEISHU_ACCOUNTS_HOST, FEISHU_CONFIRM_HOST]
   const res = await postForm(host, {
     action: 'begin',
     archetype: 'PersonalAgent',
@@ -127,7 +132,7 @@ export async function beginRegistration(options: RegisterOptions): Promise<Regis
 
   // The URL is displayed directly to the user, so treat the response as
   // untrusted input even though it came from the accounts API.
-  const url = verificationUrl(res.verification_uri_complete, host)
+  const url = verificationUrl(res.verification_uri_complete, confirmHosts)
   url.searchParams.set('from', 'sdk')
   url.searchParams.set('tp', 'sdk')
   url.searchParams.set('source', 'dsh-feishu')

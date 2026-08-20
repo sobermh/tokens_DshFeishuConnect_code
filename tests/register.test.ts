@@ -62,6 +62,24 @@ test('registration business scenarios', { concurrency: false }, async (t) => {
     })
   })
 
+  await t.test('POS-51 current Feishu launcher confirmation host is accepted', async () => {
+    await withFetch(async () => jsonResponse({
+      device_code: 'cn-device', verification_uri_complete: 'https://open.feishu.cn/page/launcher',
+    }), async () => {
+      const result = await beginRegistration(options())
+      assert.equal(new URL(result.qrUrl).hostname, 'open.feishu.cn')
+    })
+  })
+
+  await t.test('POS-52 current Lark launcher confirmation host is accepted', async () => {
+    await withFetch(async () => jsonResponse({
+      device_code: 'global-device', verification_uri_complete: 'https://open.larksuite.com/page/launcher',
+    }), async () => {
+      const result = await beginRegistration(options('lark'))
+      assert.equal(new URL(result.qrUrl).hostname, 'open.larksuite.com')
+    })
+  })
+
   await t.test('POS-21 confirmation link contains the requested app identity', async () => {
     await withFetch(async () => jsonResponse({
       device_code: 'device', verification_uri_complete: 'https://accounts.feishu.cn/confirm?existing=1',

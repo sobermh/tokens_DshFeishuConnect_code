@@ -1,4 +1,4 @@
-# @tokens/feishu — 飞书连接插件
+# @tokens/dsh-feishu-connect — 飞书连接插件
 
 一键连接飞书，面向小白：浏览器点两个链接就完成授权，**无需去开发者后台、无需配置回调、无需管理员审批**。
 
@@ -21,13 +21,13 @@ pnpm dsh --profile <名字> web
 pnpm dsh plugin --profile <名字> add /path/to/tokens_DshFeishuConnect_code
 ```
 
-验证层已加载（应出现 `# == @tokens/feishu`）：
+验证层已加载（应出现 `# == @tokens/dsh-feishu-connect`）：
 
 ```sh
 pnpm dsh --profile <名字> --dump-config
 ```
 
-卸载：`pnpm dsh plugin --profile <名字> remove @tokens/feishu`
+卸载：`pnpm dsh plugin --profile <名字> remove @tokens/dsh-feishu-connect`
 
 ## 使用
 
